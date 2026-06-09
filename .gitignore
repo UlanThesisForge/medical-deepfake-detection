@@ -1,0 +1,13 @@
+# Python
+**/__pycache__/
+*.pyc
+
+# Virtual envs
+**/venv/
+**/venom/
+
+# Frontend
+frontend/node_modules/
+
+# AI project
+data/*
