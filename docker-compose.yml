@@ -11,10 +11,11 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U postgres -d deepfakemedical"]
+      interval: 3s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
 
   backend:
     build:
@@ -23,7 +24,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5431/deepfakemedical
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/deepfakemedical
       SECRET_KEY: zameni-na-sluchainuyu-stroku-minimum-32-simvola
       FRONTEND_URL: http://localhost:5173
       MODEL_PATH: /app/models/best_model.pt
@@ -35,6 +36,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: on-failure
     command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:

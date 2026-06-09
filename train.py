@@ -240,7 +240,9 @@ def train(args):
 
     # Данные
     print("\n[1/5] Загрузка данных...")
-    records = load_dataset()
+    # records = load_dataset()
+    records = load_dataset("data/labels_small.csv")
+
     train_dl, val_dl, test_dl = create_dataloaders(records, args.batch_size)
 
     # Модель
