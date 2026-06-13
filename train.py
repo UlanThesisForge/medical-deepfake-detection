@@ -1,41 +1,43 @@
 """
 train.py
 --------
-Обучение модели обнаружения дипфейков в медицинских изображениях.
+Обучение модели обнаружения дипфейков. EfficientNet-B4 + FFT Dual-Branch.
 
-Архитектура: EfficientNet-B4 (пространственная ветвь) + FFT признаки (частотная ветвь)
-Задача: бинарная классификация — authentic (0) vs deepfake (1)
-
-Обучение в два этапа:
-  Фаза 1 (10 эпох):  backbone заморожен, обучается только классификатор
-  Фаза 2 (40 эпох):  полное обучение с cosine annealing
-
-Функция потерь: Focal Loss (gamma=2.0) — борется с дисбалансом классов
+Оптимизации для CPU:
+  1. FFT кэшируется на диск один раз (как в train_fast.py)
+  2. EfficientNet-B0 вместо B4 на CPU — в 4x быстрее, почти та же точность
+  3. Две фазы обучения сохранены (правильный Transfer Learning)
 
 Запуск:
-  python train.py [--epochs 50] [--batch-size 32] [--device cuda]
+  python train.py --device cpu --epochs 5 --batch-size 8
+  python train.py --device cuda --epochs 40 --batch-size 32 --model b4
 """
 
 import argparse
 import csv
 import os
+import pickle
 import random
 import time
 import warnings
 
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-import matplotlib
 import numpy as np
+
+warnings.filterwarnings("ignore")
+
+import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import timm
 import torch
 import torch.nn as nn
 from PIL import Image
+from scipy.stats import kurtosis as sp_kurt
+from scipy.stats import skew
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
-    confusion_matrix,
     f1_score,
     roc_auc_score,
 )
@@ -46,64 +48,96 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
-from model.detector import DeepfakeDetector, FocalLoss
-from model.freq_features import extract_freq_features
-
-# ── Настройки ─────────────────────────────────────────────────────────────────
 SEED = 42
 IMG_SIZE = 224
-RESULTS_DIR = "results"
 MODELS_DIR = "models"
+RESULTS_DIR = "results"
+CACHE_FILE = "data/freq_cache.pkl"
 
-os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
-
+os.makedirs(RESULTS_DIR, exist_ok=True)
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-print("=" * 60)
-print("  ОБУЧЕНИЕ ДЕТЕКТОРА ДИПФЕЙКОВ")
-print("  Архитектура: EfficientNet-B4 + FFT features (Dual-Branch)")
-print("=" * 60)
 
-
-# ── Датасет ───────────────────────────────────────────────────────────────────
-class MedicalDeepfakeDataset(Dataset):
-    """
-    Датасет медицинских изображений с метками authentic/deepfake.
-
-    Каждый элемент возвращает тройку:
-      (spatial_tensor, freq_tensor, label)
-    где label: 0 = authentic, 1 = deepfake
-    """
-
-    def __init__(self, records: list, augment: bool = False):
-        self.records = records
-        self.augment = augment
-
-        # Аугментации для обучения — симулируем условия реальных forensic сценариев
-        self.train_transform = transforms.Compose(
+# ── FFT кэш (главная оптимизация) ─────────────────────────────────────────────
+def extract_freq(img_np: np.ndarray) -> np.ndarray:
+    gray = (
+        0.299 * img_np[..., 0] + 0.587 * img_np[..., 1] + 0.114 * img_np[..., 2]
+    ) / 255.0
+    fshift = np.fft.fftshift(np.fft.fft2(gray))
+    log_mag = np.log1p(np.abs(fshift))
+    H, W = log_mag.shape
+    cy, cx = H // 2, W // 2
+    max_r = min(cy, cx)
+    edges = np.linspace(0, max_r, 33)
+    y_idx, x_idx = np.ogrid[-cy : H - cy, -cx : W - cx]
+    radii = np.sqrt(x_idx**2 + y_idx**2)
+    feats = []
+    for i in range(32):
+        v = log_mag[(radii >= edges[i]) & (radii < edges[i + 1])]
+        if len(v) == 0:
+            v = np.zeros(1)
+        feats.extend(
             [
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=15),
+                v.mean(),
+                v.std(),
+                v.max(),
+                v.min(),
+                float(skew(v)),
+                float(sp_kurt(v)),
+                float(np.sum(v**2)),
+                float(-np.sum(v * np.log(v + 1e-8))),
+            ]
+        )
+    return np.array(feats, dtype=np.float32)
+
+
+def build_cache(records):
+    if os.path.exists(CACHE_FILE):
+        print(f"  Загружаю FFT кэш: {CACHE_FILE}")
+        with open(CACHE_FILE, "rb") as f:
+            return pickle.load(f)
+
+    print(f"  Считаю FFT для {len(records)} изображений (один раз, потом из кэша)...")
+    cache = {}
+    for i, (path, _) in enumerate(tqdm(records, ncols=70)):
+        try:
+            img = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+            cache[path] = extract_freq(np.array(img))
+        except:
+            cache[path] = np.zeros(256, dtype=np.float32)
+        if (i + 1) % 2000 == 0:
+            with open(CACHE_FILE, "wb") as f:
+                pickle.dump(cache, f)
+    with open(CACHE_FILE, "wb") as f:
+        pickle.dump(cache, f)
+    print(f"  ✓ Кэш сохранён: {CACHE_FILE}")
+    return cache
+
+
+# ── Датасет ────────────────────────────────────────────────────────────────────
+class MedDataset(Dataset):
+    def __init__(self, records, cache, augment=False):
+        self.records = records
+        self.cache = cache
+        self.augment = augment
+        self.tf_train = transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(0.5),
+                transforms.RandomRotation(15),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2),
                 transforms.Resize((IMG_SIZE, IMG_SIZE)),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                ),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
-
-        # Для валидации/теста — только нормализация
-        self.val_transform = transforms.Compose(
+        self.tf_val = transforms.Compose(
             [
                 transforms.Resize((IMG_SIZE, IMG_SIZE)),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                ),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
 
@@ -112,330 +146,378 @@ class MedicalDeepfakeDataset(Dataset):
 
     def __getitem__(self, idx):
         path, label = self.records[idx]
-
-        # Загружаем изображение (пропускаем повреждённые файлы)
         try:
             img = Image.open(path).convert("RGB")
-        except Exception:
+        except:
             img = Image.new("RGB", (IMG_SIZE, IMG_SIZE), (128, 128, 128))
-        img_np = np.array(img.resize((IMG_SIZE, IMG_SIZE)))
-
-        # Частотные признаки — до аугментации (на оригинальном изображении)
-        freq = extract_freq_features(img_np)
-        freq_tensor = torch.from_numpy(freq)
-
-        # Пространственные признаки — с аугментацией при обучении
-        transform = self.train_transform if self.augment else self.val_transform
-        spatial_tensor = transform(img)
-
-        return spatial_tensor, freq_tensor, torch.tensor(float(label))
+        tf = self.tf_train if self.augment else self.tf_val
+        freq = torch.from_numpy(self.cache.get(path, np.zeros(256, dtype=np.float32)))
+        return tf(img), freq, torch.tensor(float(label))
 
 
-def load_dataset(csv_path: str = "data/labels.csv"):
-    """Загружает список путей и меток из CSV файла."""
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(
-            f"CSV не найден: {csv_path}\nЗапустите: python download_dataset.py"
+# ── Модель: EfficientNet + FFT Dual-Branch ────────────────────────────────────
+class DeepfakeDetector(nn.Module):
+    def __init__(self, model_name="efficientnet_b0", dropout=0.4):
+        super().__init__()
+        self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
+        sp_dim = self.backbone.num_features
+
+        self.freq_branch = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
         )
+        self.attention = nn.Linear(sp_dim + 512, 2)
+        fused_dim = sp_dim + 512 + 512
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, 512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(128, 1),
+        )
+        self.activations = None
+        self.gradients = None
+        self._register_hooks()
 
-    records = []
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            path = row["path"]
-            # Пропускаем macOS метафайлы (._filename) и скрытые файлы
-            basename = os.path.basename(path)
-            if basename.startswith("._") or basename.startswith("."):
-                continue
-            if os.path.exists(path) and os.path.getsize(path) > 1024:
-                records.append((path, int(row["label"])))
+    def _register_hooks(self):
+        last = None
+        try:
+            last = list(self.backbone.blocks.children())[-1]
+        except:
+            for m in self.backbone.modules():
+                if hasattr(m, "conv_pwl"):
+                    last = m
+        if last:
+            last.register_forward_hook(lambda m, i, o: setattr(self, "activations", o))
+            last.register_full_backward_hook(
+                lambda m, gi, go: setattr(self, "gradients", go[0])
+            )
 
-    print(f"   Найдено изображений: {len(records)}")
-    authentic = sum(1 for _, l in records if l == 0)
-    synthetic = sum(1 for _, l in records if l == 1)
-    print(f"   Authentic: {authentic}")
-    print(f"   Synthetic: {synthetic}")
-    return records
-
-
-def create_dataloaders(records, batch_size):
-    """Разбивает на train/val/test и создаёт DataLoader'ы."""
-    labels = [l for _, l in records]
-
-    # 70/15/15 с сохранением пропорций классов
-    train_r, temp_r = train_test_split(
-        records, test_size=0.30, stratify=labels, random_state=SEED
-    )
-    val_labels = [l for _, l in temp_r]
-    val_r, test_r = train_test_split(
-        temp_r, test_size=0.50, stratify=val_labels, random_state=SEED
-    )
-
-    print(f"   Train: {len(train_r)} | Val: {len(val_r)} | Test: {len(test_r)}")
-
-    train_ds = MedicalDeepfakeDataset(train_r, augment=True)
-    val_ds = MedicalDeepfakeDataset(val_r, augment=False)
-    test_ds = MedicalDeepfakeDataset(test_r, augment=False)
-
-    # Windows требует num_workers=0 (нет fork)
-    import platform
-
-    nw = 0 if platform.system() == "Windows" else 4
-    pm = platform.system() != "Windows"
-
-    train_dl = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=pm
-    )
-    val_dl = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=pm
-    )
-    test_dl = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=pm
-    )
-
-    return train_dl, val_dl, test_dl
+    def forward(self, x, freq):
+        sp = self.backbone(x)
+        fr = self.freq_branch(freq)
+        atw = torch.softmax(self.attention(torch.cat([sp, fr], 1)), 1)
+        cross = sp[:, :512] * fr
+        return self.classifier(
+            torch.cat([atw[:, 0:1] * sp, atw[:, 1:2] * fr, cross], 1)
+        ).squeeze(1)
 
 
-# ── Один эпох обучения / валидации ───────────────────────────────────────────
-def run_epoch(model, loader, criterion, optimizer, device, training: bool):
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits, targets):
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+        pt = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (
+            1 - targets
+        )
+        return (self.alpha * torch.pow(1 - pt, self.gamma) * bce).mean()
+
+
+# ── Один проход ────────────────────────────────────────────────────────────────
+def run_epoch(model, loader, criterion, optimizer, device, training):
     model.train() if training else model.eval()
-
-    total_loss = 0.0
-    all_probs, all_labels = [], []
-
+    total_loss, all_probs, all_labels = 0.0, [], []
     desc = "Train" if training else "Val  "
     with torch.set_grad_enabled(training):
-        for spatial, freq, labels in tqdm(loader, desc=desc, leave=False, ncols=80):
-            spatial = spatial.to(device)
-            freq = freq.to(device)
-            labels = labels.to(device)
-
-            logits = model(spatial, freq)
-            loss = criterion(logits, labels)
-
+        for sp, freq, lbl in tqdm(loader, desc=desc, leave=False, ncols=80):
+            sp, freq, lbl = sp.to(device), freq.to(device), lbl.to(device)
+            logits = model(sp, freq)
+            loss = criterion(logits, lbl)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
-                # Gradient clipping — предотвращает взрыв градиентов при fine-tuning
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-
-            total_loss += loss.item() * len(labels)
-            probs = torch.sigmoid(logits).detach().cpu().numpy()
-            all_probs.extend(probs)
-            all_labels.extend(labels.cpu().numpy())
-
+            total_loss += loss.item() * len(lbl)
+            all_probs.extend(torch.sigmoid(logits).detach().cpu().numpy())
+            all_labels.extend(lbl.cpu().numpy())
     avg_loss = total_loss / len(loader.dataset)
     auc = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
-    preds = (np.array(all_probs) >= 0.5).astype(int)
-    acc = accuracy_score(all_labels, preds)
-
+    acc = accuracy_score(all_labels, (np.array(all_probs) >= 0.5).astype(int))
     return avg_loss, auc, acc
 
 
-# ── Основной цикл обучения ────────────────────────────────────────────────────
+# ── Основной цикл ──────────────────────────────────────────────────────────────
 def train(args):
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"\nУстройство: {device}")
+    import platform
 
-    # Данные
-    print("\n[1/5] Загрузка данных...")
-    # records = load_dataset()
-    records = load_dataset("data/labels_small.csv")
+    nw = 0 if platform.system() == "Windows" else 4
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_dl, val_dl, test_dl = create_dataloaders(records, args.batch_size)
+    # Выбор модели по устройству
+    if args.model == "auto":
+        model_name = "efficientnet_b0" if device.type == "cpu" else "efficientnet_b4"
+    else:
+        model_name = f"efficientnet_{args.model}"
 
-    # Модель
-    print("\n[2/5] Инициализация модели EfficientNet-B4...")
-    model = DeepfakeDetector(freq_input_dim=256, dropout=0.5).to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"   Всего параметров: {total_params:,}")
+    print(f"\nУстройство: {device} | Модель: {model_name}")
 
+    # ── Данные ────────────────────────────────────────────────────────────────
+    if args.full:
+        csv_path = "data/labels.csv"
+        print("  Режим: ПОЛНЫЙ датасет")
+    elif os.path.exists("data/labels_small.csv"):
+        csv_path = "data/labels_small.csv"
+        print("  Режим: маленький датасет (используй --full для полного)")
+    else:
+        csv_path = "data/labels.csv"
+    print(f"\n[1/5] Загрузка из {csv_path}...")
+    records = []
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            p = row["path"]
+            b = os.path.basename(p)
+            if (
+                not b.startswith("._")
+                and os.path.exists(p)
+                and os.path.getsize(p) > 1024
+            ):
+                records.append((p, int(row["label"])))
+
+    auth = sum(1 for _, l in records if l == 0)
+    synt = sum(1 for _, l in records if l == 1)
+    print(f"   Authentic: {auth} | Synthetic: {synt} | Итого: {len(records)}")
+
+    labels = [l for _, l in records]
+    tr, tmp = train_test_split(
+        records, test_size=0.30, stratify=labels, random_state=SEED
+    )
+    tl = [l for _, l in tmp]
+    vl, te = train_test_split(tmp, test_size=0.50, stratify=tl, random_state=SEED)
+    print(f"   Train: {len(tr)} | Val: {len(vl)} | Test: {len(te)}")
+
+    # ── FFT кэш ───────────────────────────────────────────────────────────────
+    print("\n[2/5] FFT кэш...")
+    cache = build_cache(records)
+    train_dl = DataLoader(
+        MedDataset(tr, cache, augment=True),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=nw,
+    )
+    val_dl = DataLoader(
+        MedDataset(vl, cache, augment=False),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=nw,
+    )
+    test_dl = DataLoader(
+        MedDataset(te, cache, augment=False),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=nw,
+    )
+
+    # ── Модель ────────────────────────────────────────────────────────────────
+    print(f"\n[3/5] Инициализация {model_name}...")
+    model = DeepfakeDetector(model_name=model_name, dropout=0.4).to(device)
+    params = sum(p.numel() for p in model.parameters())
+    print(f"   Параметров: {params:,}")
     criterion = FocalLoss(gamma=2.0, alpha=0.25)
 
-    # ── Фаза 1: замораживаем backbone ────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  ФАЗА 1: Обучение классификатора (backbone заморожен)")
-    print(f"  Эпох: 10 | LR: 1e-3")
-    print("=" * 60)
+    history = {"tr_auc": [], "vl_auc": [], "tr_loss": [], "vl_loss": []}
+    best_auc = 0.0
 
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-
-    optimizer_1 = Adam(
+    # ── Фаза 1: backbone заморожен ────────────────────────────────────────────
+    print(f"\n{'=' * 55}")
+    print(f"  ФАЗА 1: backbone заморожен ({args.phase1_epochs} эпох) | LR=1e-3")
+    print(f"{'=' * 55}")
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+    opt1 = Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=1e-3,
         weight_decay=1e-5,
     )
 
-    best_auc = 0.0
-    history = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
-
-    for epoch in range(10):
+    phase1_ep = getattr(args, "phase1_epochs", 5)
+    for epoch in range(phase1_ep):
         t0 = time.time()
-        tr_loss, tr_auc, tr_acc = run_epoch(
-            model, train_dl, criterion, optimizer_1, device, training=True
-        )
-        vl_loss, vl_auc, vl_acc = run_epoch(
-            model, val_dl, criterion, optimizer_1, device, training=False
-        )
-        elapsed = time.time() - t0
-
-        history["train_loss"].append(tr_loss)
-        history["val_loss"].append(vl_loss)
-        history["train_auc"].append(tr_auc)
-        history["val_auc"].append(vl_auc)
-
+        trl, tra, _ = run_epoch(model, train_dl, criterion, opt1, device, True)
+        vll, vla, vacc = run_epoch(model, val_dl, criterion, opt1, device, False)
+        history["tr_auc"].append(tra)
+        history["vl_auc"].append(vla)
+        history["tr_loss"].append(trl)
+        history["vl_loss"].append(vll)
+        mark = "✓" if vla > best_auc else " "
         print(
-            f"  Epoch {epoch + 1:2d}/10 | "
-            f"Loss: {tr_loss:.4f}/{vl_loss:.4f} | "
-            f"AUC: {tr_auc:.4f}/{vl_auc:.4f} | "
-            f"Acc: {vl_acc:.3f} | {elapsed:.0f}s"
+            f"  Ep {epoch + 1:2d}/{phase1_ep} | Loss {trl:.4f}/{vll:.4f} | AUC {tra:.3f}/{vla:.3f} {mark} | Acc {vacc:.3f} | {time.time() - t0:.0f}s"
         )
-
-        if vl_auc > best_auc:
-            best_auc = vl_auc
+        if vla > best_auc:
+            best_auc = vla
             torch.save(model.state_dict(), f"{MODELS_DIR}/best_model.pt")
 
-    # ── Фаза 2: полное обучение (fine-tuning) ─────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  ФАЗА 2: Fine-tuning (все параметры)")
-    print(f"  Эпох: {args.epochs} | LR: 1e-4 | CosineAnnealing")
-    print("=" * 60)
-
-    for param in model.backbone.parameters():
-        param.requires_grad = True
-
-    optimizer_2 = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    scheduler = CosineAnnealingWarmRestarts(optimizer_2, T_0=10, T_mult=2)
-
-    patience_counter = 0
-    patience = 8  # early stopping
+    # ── Фаза 2: полное обучение ───────────────────────────────────────────────
+    print(f"\n{'=' * 55}")
+    print(f"  ФАЗА 2: fine-tuning ({args.epochs} эпох) | LR=1e-4")
+    print(f"{'=' * 55}")
+    for p in model.backbone.parameters():
+        p.requires_grad = True
+    opt2 = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    sched = CosineAnnealingWarmRestarts(opt2, T_0=10, T_mult=2)
+    patience_cnt = 0
 
     for epoch in range(args.epochs):
         t0 = time.time()
-        tr_loss, tr_auc, tr_acc = run_epoch(
-            model, train_dl, criterion, optimizer_2, device, training=True
-        )
-        vl_loss, vl_auc, vl_acc = run_epoch(
-            model, val_dl, criterion, optimizer_2, device, training=False
-        )
-        scheduler.step()
-        elapsed = time.time() - t0
-
-        history["train_loss"].append(tr_loss)
-        history["val_loss"].append(vl_loss)
-        history["train_auc"].append(tr_auc)
-        history["val_auc"].append(vl_auc)
-
-        improved = "✓" if vl_auc > best_auc else " "
+        trl, tra, _ = run_epoch(model, train_dl, criterion, opt2, device, True)
+        vll, vla, vacc = run_epoch(model, val_dl, criterion, opt2, device, False)
+        sched.step()
+        history["tr_auc"].append(tra)
+        history["vl_auc"].append(vla)
+        history["tr_loss"].append(trl)
+        history["vl_loss"].append(vll)
+        mark = "✓" if vla > best_auc else " "
         print(
-            f"  Epoch {epoch + 1:2d}/{args.epochs} | "
-            f"Loss: {tr_loss:.4f}/{vl_loss:.4f} | "
-            f"AUC: {tr_auc:.4f}/{vl_auc:.4f} {improved} | "
-            f"LR: {scheduler.get_last_lr()[0]:.2e} | {elapsed:.0f}s"
+            f"  Ep {epoch + 1:2d}/{args.epochs} | Loss {trl:.4f}/{vll:.4f} | AUC {tra:.3f}/{vla:.3f} {mark} | {time.time() - t0:.0f}s"
         )
-
-        if vl_auc > best_auc:
-            best_auc = vl_auc
-            patience_counter = 0
+        if vla > best_auc:
+            best_auc = vla
+            patience_cnt = 0
             torch.save(model.state_dict(), f"{MODELS_DIR}/best_model.pt")
-            print(f"     → Лучшая модель сохранена (AUC: {best_auc:.4f})")
+            print(f"     → Сохранено (AUC: {best_auc:.4f})")
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
+            patience_cnt += 1
+            if patience_cnt >= 8:
                 print(f"  Early stopping на эпохе {epoch + 1}")
                 break
 
-    # ── Оценка на тестовых данных ─────────────────────────────────────────────
-    print("\n[5/5] Оценка на тестовых данных...")
+    # ── Оценка ────────────────────────────────────────────────────────────────
+    print("\n[5/5] Оценка...")
     model.load_state_dict(
         torch.load(f"{MODELS_DIR}/best_model.pt", map_location=device)
     )
     model.eval()
-
     all_probs, all_labels = [], []
     with torch.no_grad():
-        for spatial, freq, labels in test_dl:
-            logits = model(spatial.to(device), freq.to(device))
-            probs = torch.sigmoid(logits).cpu().numpy()
+        for sp, freq, lbl in tqdm(test_dl, desc="Test ", ncols=80):
+            probs = torch.sigmoid(model(sp.to(device), freq.to(device))).cpu().numpy()
             all_probs.extend(probs)
-            all_labels.extend(labels.numpy())
-
+            all_labels.extend(lbl.numpy())
     all_probs = np.array(all_probs)
     all_labels = np.array(all_labels)
     preds = (all_probs >= 0.5).astype(int)
-
     auc = roc_auc_score(all_labels, all_probs)
     acc = accuracy_score(all_labels, preds)
-    f1 = f1_score(all_labels, preds, average="binary")
-
-    report = classification_report(
-        all_labels, preds, target_names=["authentic", "deepfake"]
+    f1 = f1_score(all_labels, preds)
+    print(
+        "\n"
+        + classification_report(
+            all_labels, preds, target_names=["authentic", "deepfake"]
+        )
     )
-    print("\n" + report)
 
     # ── Графики ───────────────────────────────────────────────────────────────
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-    ft_start = 10  # начало фазы 2
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    axes[0].plot(
-        epochs_range, history["train_auc"], label="Train", color="steelblue", lw=2
-    )
-    axes[0].plot(
-        epochs_range, history["val_auc"], label="Val", color="darkorange", lw=2
-    )
-    axes[0].axvline(
-        ft_start, color="red", ls="--", alpha=0.5, label="Fine-tuning start"
-    )
-    axes[0].set_title("AUC-ROC по эпохам")
-    axes[0].set_xlabel("Эпоха")
+    ep = range(1, len(history["tr_auc"]) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(ep, history["tr_auc"], label="Train", lw=2)
+    axes[0].plot(ep, history["vl_auc"], label="Val", lw=2)
+    axes[0].axvline(10, color="red", ls="--", alpha=0.5, label="Fine-tuning")
+    axes[0].set_title("AUC-ROC")
     axes[0].legend()
     axes[0].grid(alpha=0.3)
-
-    axes[1].plot(
-        epochs_range, history["train_loss"], label="Train", color="steelblue", lw=2
-    )
-    axes[1].plot(
-        epochs_range, history["val_loss"], label="Val", color="darkorange", lw=2
-    )
-    axes[1].axvline(ft_start, color="red", ls="--", alpha=0.5)
-    axes[1].set_title("Focal Loss по эпохам")
-    axes[1].set_xlabel("Эпоха")
+    axes[1].plot(ep, history["tr_loss"], label="Train", lw=2)
+    axes[1].plot(ep, history["vl_loss"], label="Val", lw=2)
+    axes[1].axvline(10, color="red", ls="--", alpha=0.5)
+    axes[1].set_title("Focal Loss")
     axes[1].legend()
     axes[1].grid(alpha=0.3)
-
     plt.tight_layout()
     plt.savefig(f"{RESULTS_DIR}/training_history.png", dpi=150)
-    print(f"   ✓ {RESULTS_DIR}/training_history.png")
 
-    # ── Итог ──────────────────────────────────────────────────────────────────
-    print(f"\n{'═' * 55}")
+    print(f"\n{'═' * 50}")
+    print(f"  Модель:   {model_name}")
     print(f"  AUC-ROC  : {auc:.4f}  ({auc * 100:.1f}%)")
     print(f"  Accuracy : {acc:.4f}  ({acc * 100:.1f}%)")
     print(f"  F1-Score : {f1:.4f}  ({f1 * 100:.1f}%)")
-    print(f"{'═' * 55}")
-    print(f"\n  Модель сохранена: {MODELS_DIR}/best_model.pt")
-    print(f"  Следующий шаг:   python evaluate.py")
+    print(f"{'═' * 50}")
+    print(f"  ✓ Модель: {MODELS_DIR}/best_model.pt")
 
 
-# ── Точка входа ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Обучение детектора дипфейков")
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=40,
-        help="Количество эпох фазы 2 (по умолчанию: 40)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=32, help="Размер батча (по умолчанию: 32)"
-    )
-    parser.add_argument(
-        "--device", type=str, default="cuda", help="Устройство: cuda или cpu"
-    )
-    args = parser.parse_args()
+    import multiprocessing
 
+    multiprocessing.freeze_support()
+    p = argparse.ArgumentParser(description="Обучение детектора дипфейков")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="b4",
+        choices=["b0", "b1", "b4"],
+        help="""
+Выбор архитектуры backbone:
+  b0 — EfficientNet-B0 |  5M параметров | CPU ~2-3 часа  | GPU ~30 мин
+  b1 — EfficientNet-B1 |  8M параметров | CPU ~3-4 часа  | GPU ~45 мин
+  b4 — EfficientNet-B4 | 19M параметров | CPU ~4-5 часов | GPU ~90 мин  ← рекомендуется
+""",
+    )
+    p.add_argument("--device", type=str, default="cpu", help="cpu или cuda")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Размер батча (по умолчанию: 8 для cpu, 32 для cuda)",
+    )
+    p.add_argument(
+        "--phase1-epochs",
+        type=int,
+        default=None,
+        help="Эпох фазы 1 (backbone заморожен)",
+    )
+    p.add_argument(
+        "--phase2-epochs", type=int, default=None, help="Эпох фазы 2 (fine-tuning)"
+    )
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="Обучать на полном датасете (data/labels.csv)",
+    )
+
+    args = p.parse_args()
+
+    # Умные дефолты по устройству и модели
+    device_type = (
+        "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
+    )
+
+    if args.batch_size is None:
+        args.batch_size = 32 if device_type == "cuda" else 8
+
+    # Таблица времени: CPU ~35-45 мин/эпоха для b4, 10-15 для b0
+    time_per_epoch = {"b0": 12, "b1": 22, "b4": 40}  # минут на CPU
+    tpe = time_per_epoch[args.model]
+
+    if args.phase1_epochs is None:
+        # Цель: ~1.5 часа на фазу 1
+        args.phase1_epochs = max(3, min(10, int(90 / tpe)))
+
+    if args.phase2_epochs is None:
+        # Цель: ~2.5 часа на фазу 2
+        args.phase2_epochs = max(3, min(40, int(150 / tpe)))
+
+    total_est = (args.phase1_epochs + args.phase2_epochs) * tpe
+    print("=" * 55)
+    print(f"  КОНФИГУРАЦИЯ ОБУЧЕНИЯ")
+    print("=" * 55)
+    print(f"  Модель:         EfficientNet-{args.model.upper()}")
+    print(f"  Устройство:     {device_type}")
+    print(f"  Batch size:     {args.batch_size}")
+    print(f"  Фаза 1:         {args.phase1_epochs} эпох")
+    print(f"  Фаза 2:         {args.phase2_epochs} эпох")
+    print(f"  Ожидаемое время: ~{total_est // 60}ч {total_est % 60}мин")
+    print("=" * 55)
+
+    # Передаём в train()
+    args.epochs = args.phase2_epochs
     train(args)

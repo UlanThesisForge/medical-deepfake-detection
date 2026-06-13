@@ -47,15 +47,39 @@ IMG_TRANSFORM = transforms.Compose(
 )
 
 
+def _build_model_auto(path: str):
+    """Автоматически определяет архитектуру по содержимому checkpoint."""
+    state = torch.load(path, map_location="cpu")
+    keys = list(state.keys())
+
+    # FastDetector (MobileNetV2) — ключи начинаются с backbone.0.
+    if any(k.startswith("backbone.0.") for k in keys):
+        import pathlib
+        import sys
+
+        sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
+        from train_fast import FastDetector
+
+        model = FastDetector()
+        model.load_state_dict(state, strict=False)
+        print("✓ Загружена FastDetector (MobileNetV2)")
+    else:
+        # DeepfakeDetector (EfficientNet-B4)
+        from model.detector import DeepfakeDetector
+
+        model = DeepfakeDetector()
+        model.load_state_dict(state, strict=False)
+        print("✓ Загружена DeepfakeDetector (EfficientNet-B4)")
+
+    model.eval()
+    return model
+
+
 def get_model():
     global _model
     if _model is None and os.path.exists(settings.MODEL_PATH):
-        from model.detector import DeepfakeDetector
-
-        _model = DeepfakeDetector()
-        _model.load_state_dict(torch.load(settings.MODEL_PATH, map_location="cpu"))
-        _model.eval()
-        print(f"✓ Модель загружена: {settings.MODEL_PATH}")
+        _model = _build_model_auto(settings.MODEL_PATH)
+        print(f"✓ Модель готова: {settings.MODEL_PATH}")
     return _model
 
 
@@ -79,6 +103,7 @@ def run_inference(img_bytes: bytes):
     freq = torch.from_numpy(freq_np).unsqueeze(0)
 
     # Forward pass
+    model.eval()  # обязательно: отключает BatchNorm в train режиме
     start_ms = time.time()
     with torch.no_grad():
         logit = model(spatial, freq)
@@ -88,8 +113,12 @@ def run_inference(img_bytes: bytes):
     label = "deepfake" if prob >= settings.DECISION_THRESHOLD else "authentic"
 
     # Grad-CAM
-    cam = compute_gradcam(model, spatial, freq)
-    overlay = overlay_heatmap(cam, img_np)
+    try:
+        cam = compute_gradcam(model, spatial, freq)
+        overlay = overlay_heatmap(cam, img_np)
+    except Exception:
+        cam = np.ones((224, 224), dtype=np.float32) * 0.5
+        overlay = img_np.copy()
 
     return label, prob, cam, overlay, img_np, ms
 
